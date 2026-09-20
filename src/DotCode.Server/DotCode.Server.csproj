@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <ItemGroup>
+    <ProjectReference Include="..\DotCode.Core\DotCode.Core.csproj" />
+    <ProjectReference Include="..\DotCode.Agent\DotCode.Agent.csproj" />
+    <ProjectReference Include="..\DotCode.Providers\DotCode.Providers.csproj" />
+    <ProjectReference Include="..\DotCode.Tools\DotCode.Tools.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Swashbuckle.AspNetCore" Version="7.2.0" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+</Project>

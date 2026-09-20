@@ -1,0 +1,33 @@
+# .NET build output
+bin/
+obj/
+out/
+publish/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Rider
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# logs / temp
+*.log
+*.tmp
+.nuget/
+
+# node (vendored react demo under src/DotCode.Server/~/aura/ra)
+node_modules/
+dist/
+
+# dotcode local data
+.dotcode/

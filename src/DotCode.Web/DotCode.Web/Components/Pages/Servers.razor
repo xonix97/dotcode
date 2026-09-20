@@ -1,0 +1,57 @@
+@page "/servers"
+@using DotCode.Web.Services
+@inject DotCodeApi Api
+@inject NavigationManager Nav
+@rendermode InteractiveServer
+
+<PageTitle>dotcode — servers</PageTitle>
+
+<div class="dc-topbar">
+    <h1>Servers</h1>
+    <div class="spacer"></div>
+    <button class="dc-btn" @onclick='() => Nav.NavigateTo("/")'>← Sessions</button>
+</div>
+
+<div class="dc-content">
+    <div class="dc-center">
+        @if (_health is null)
+        {
+            <p class="dc-sub">connecting…</p>
+        }
+        else
+        {
+            <div class="dc-card">
+                <div class="dc-row">
+                    <h3 style="flex:1;">● localhost</h3>
+                    <span class="dc-pill ok">@(_health.Healthy ? "healthy" : "down")</span>
+                </div>
+                <p>version @_health.Version</p>
+                <p>project @_project?.Name (@_project?.Root)</p>
+                <p>sessions @_count</p>
+            </div>
+        }
+        @if (_error is not null)
+        {
+            <div class="dc-card"><h3>unreachable</h3><p>@_error</p>
+            <p>Start it with: <code>dotnet run --project src/DotCode.Server</code></p></div>
+        }
+    </div>
+</div>
+
+@code {
+    private HealthDto? _health;
+    private ProjectDto? _project;
+    private int _count;
+    private string? _error;
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            _health = await Api.HealthAsync();
+            _project = await Api.CurrentProjectAsync();
+            _count = (await Api.SessionsAsync())?.Count ?? 0;
+        }
+        catch (Exception ex) { _error = ex.Message; }
+    }
+}

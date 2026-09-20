@@ -1,0 +1,70 @@
+@using DotCode.Web.Services
+
+@* One assistant turn: markdown text + ⏺ tool rows, TUI style *@
+@foreach (var p in Thread.Parts)
+{
+    @if (p.Type == "text" && !string.IsNullOrWhiteSpace(p.Text))
+    {
+        <div class="dc-assistant"><div class="md">@((MarkupString)Markdown.ToHtml(p.Text))</div></div>
+    }
+    else if (p.Type == "thinking" && !string.IsNullOrWhiteSpace(p.Text))
+    {
+        <details class="dc-think" open="@_liveThinking">
+            <summary><span class="dc-dot">✻</span> <span class="dc-tool-name">thinking</span></summary>
+            <div class="dc-think-body">@p.Text</div>
+        </details>
+    }
+    else if (p.Type == "tool_call")
+    {
+        var result = Thread.Parts.FirstOrDefault(x => x.Type == "tool_result" && x.CallId == p.CallId);
+        <details class="dc-tool t-@ToolClass(p.Tool)" open="@(result?.IsError == true)">
+            <summary>
+                <span class="dc-dot">⏺</span>
+                <span class="dc-tool-name">@p.Tool</span>
+                <span class="dc-tool-arg">@ShortArg(p.Tool, p.Input)</span>
+            </summary>
+            @if (result is not null && !string.IsNullOrWhiteSpace(result.Output))
+            {
+                <div class="dc-tool-out @(result.IsError ? "err" : "")">@Truncate(result.Output, 2000)</div>
+            }
+        </details>
+    }
+}
+
+@code {
+    [Parameter, EditorRequired] public ThreadDto Thread { get; set; } = null!;
+
+    /// <summary>Live (in-flight) thinking renders expanded; historical thinking is collapsed.</summary>
+    private bool _liveThinking => Thread.Info.CreatedAt > DateTimeOffset.UtcNow.AddSeconds(-20);
+
+    private static string ToolClass(string? tool) => (tool ?? "").ToLowerInvariant() switch
+    {
+        "read" => "read",
+        "edit" or "write" or "apply_patch" => "edit",
+        "bash" => "bash",
+        "todowrite" or "todoread" => "todo",
+        "glob" => "glob",
+        "grep" => "grep",
+        _ => "other",
+    };
+
+    private static string ShortArg(string? tool, string? input)
+    {
+        if (string.IsNullOrWhiteSpace(input)) return "";
+        try
+        {
+            var doc = System.Text.Json.JsonDocument.Parse(input);
+            if (doc.RootElement.TryGetProperty("path", out var p)) return p.GetString() ?? "";
+            if (doc.RootElement.TryGetProperty("pattern", out var pat)) return pat.GetString() ?? "";
+            if (doc.RootElement.TryGetProperty("command", out var c))
+            {
+                var s = c.GetString() ?? "";
+                return s.Length > 80 ? s[..80] + "…" : s;
+            }
+        }
+        catch { }
+        return input.Length > 80 ? input[..80] + "…" : input;
+    }
+
+    private static string Truncate(string s, int max) => s.Length <= max ? s : s[..max] + "\n… (truncated)";
+}

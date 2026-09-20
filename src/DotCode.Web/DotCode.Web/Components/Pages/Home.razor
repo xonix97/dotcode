@@ -1,0 +1,192 @@
+@page "/"
+@using DotCode.Web.Services
+@inject DotCodeApi Api
+@inject NavigationManager Nav
+@rendermode InteractiveServer
+
+<PageTitle>dotcode</PageTitle>
+
+<div class="dc-content">
+    <div class="dc-center">
+        <div class="dc-hero"><span>◍</span> dotcode</div>
+        <div class="dc-sub">AI coding agent — Blazor edition. Pick a directory, describe a task, start.</div>
+        <div class="dc-prompt-box">
+            <textarea @bind="_text" @bind:event="oninput" placeholder="Describe a task, then ⏎ to start a new session…" rows="3"></textarea>
+            <div class="dc-prompt-row">
+                <span class="dc-hint">Type / for commands, @@ for files</span>
+                <button class="dc-btn primary" @onclick="Start" disabled="@string.IsNullOrWhiteSpace(_text)">Start session</button>
+            </div>
+        </div>
+
+        <div class="dc-settings">
+            <div class="dc-side-label">workspace directory</div>
+            <button class="dc-dir-pick" @onclick="() => _showPicker = !_showPicker" title="Choose the working directory">
+                <span class="dc-dir-path">@(string.IsNullOrEmpty(_rootName) ? "⟨server cwd⟩" : _rootName)</span>
+                <span class="dc-dir-full" title="@_rootPath">@_rootPath</span>
+                <span class="dc-dir-toggle">@(_showPicker ? "▲" : "▼")</span>
+            </button>
+            @if (_showPicker)
+            {
+                <div class="dc-picker">
+                    <input class="dc-input" type="text" @bind="_pathInput" @bind:after="BrowseToInput"
+                           placeholder="Type an absolute path…" />
+                    @if (_fsError is not null)
+                    {
+                        <div class="dc-picker-err">@_fsError</div>
+                    }
+                    <div class="dc-picker-list">
+                        @if (_browse is null)
+                        {
+                            <div class="dc-picker-item muted">loading…</div>
+                        }
+                        else
+                        {
+                            @if (_browse.Parent is not null)
+                            {
+                                <button class="dc-picker-item" @onclick="() => BrowseTo(_browse.Parent!)">↰ ..</button>
+                            }
+                            @foreach (var d in _browse.Dirs)
+                            {
+                                <button class="dc-picker-item" @onclick="() => BrowseTo(d.Path)">
+                                    📁 @d.Name
+                                </button>
+                            }
+                            @if (_browse.Dirs.Count == 0)
+                            {
+                                <div class="dc-picker-item muted">(no subdirectories)</div>
+                            }
+                        }
+                    </div>
+                    <div class="dc-row" style="justify-content: flex-end;">
+                        <button class="dc-btn" @onclick="() => _showPicker = false">Cancel</button>
+                        <button class="dc-btn primary" @onclick="UseHere" disabled="@(_browse is null)">Use this directory</button>
+                    </div>
+                </div>
+            }
+
+            <div class="dc-side-label" style="margin-top:18px;">session defaults</div>
+            <div class="dc-grid2">
+                <label class="dc-field">
+                    <span>temperature</span>
+                    <input class="dc-input" type="number" step="0.1" min="0" max="2" @bind="_temp" />
+                </label>
+                <label class="dc-field">
+                    <span>max steps</span>
+                    <input class="dc-input" type="number" step="1" min="1" max="100" @bind="_maxSteps" />
+                </label>
+            </div>
+            <label class="dc-field" style="margin-top:10px;">
+                <span>extra instructions for the agent</span>
+                <textarea class="dc-input" rows="2" @bind="_instructions" placeholder="e.g. prefer early returns, always write tests…"></textarea>
+            </label>
+            <p class="dc-note">Applied to new sessions; the same panel is available inside a session via ⚙ settings.</p>
+        </div>
+
+        <div class="dc-side-label" style="margin-top:26px;">Sessions</div>
+        @if (_sessions is null)
+        {
+            <p class="dc-sub">loading…</p>
+        }
+        else if (_sessions.Count == 0)
+        {
+            <p class="dc-sub">No sessions yet — the first one starts above.</p>
+        }
+        else
+        {
+            <div class="dc-rows">
+                @foreach (var s in _sessions)
+                {
+                    <div class="dc-rowitem">
+                        <h3><a href="@($"s/{s.Id}")">@s.Title</a></h3>
+                        <span class="dc-meta">@Ago(s.UpdatedAt)</span>
+                        <button class="dc-btn danger" @onclick="() => Delete(s.Id)">delete</button>
+                    </div>
+                }
+            </div>
+        }
+        <p style="margin-top:18px;"><a href="connect">Connect a model →</a></p>
+    </div>
+</div>
+
+@code {
+    private string _text = "";
+    private List<SessionDto>? _sessions;
+
+    // directory picker state
+    private bool _showPicker;
+    private FsBrowseDto? _browse;
+    private string _pathInput = "";
+    private string? _fsError;
+    private string? _rootPath;
+    private string? _rootName;
+
+    // session defaults
+    private double? _temp;
+    private int? _maxSteps;
+    private string _instructions = "";
+
+    protected override async Task OnInitializedAsync()
+    {
+        try { _sessions = await Api.SessionsAsync(); } catch { _sessions = new(); }
+        try
+        {
+            var p = await Api.CurrentProjectAsync();
+            if (p is not null) { _rootPath = p.Root; _rootName = p.Name; }
+        }
+        catch { }
+        try { _browse = await Api.BrowseFsAsync(); _pathInput = _browse?.Path ?? ""; } catch { }
+    }
+
+    private async Task BrowseTo(string path)
+    {
+        _fsError = null;
+        try { _browse = await Api.BrowseFsAsync(path); _pathInput = _browse?.Path ?? path; }
+        catch (Exception ex) { _fsError = $"can't open: {ex.Message}"; }
+    }
+
+    private async Task BrowseToInput()
+    {
+        if (!string.IsNullOrWhiteSpace(_pathInput)) await BrowseTo(_pathInput.Trim());
+    }
+
+    private async Task UseHere()
+    {
+        if (_browse is null) return;
+        try
+        {
+            var r = await Api.SelectProjectAsync(_browse.Path);
+            if (r is not null) { _rootPath = r.Root; _rootName = r.Name; }
+            _showPicker = false;
+        }
+        catch (Exception ex) { _fsError = $"failed: {ex.Message}"; }
+    }
+
+    private async Task Start()
+    {
+        var s = await Api.CreateSessionAsync(null);
+        if (s is null) return;
+        if (!string.IsNullOrWhiteSpace(_text))
+        {
+            var settings = (_temp is not null || _maxSteps is not null || !string.IsNullOrWhiteSpace(_instructions))
+                ? new SessionSettings(_temp, _maxSteps, string.IsNullOrWhiteSpace(_instructions) ? null : _instructions)
+                : null;
+            try { await Api.PostMessageAsync(s.Id, _text, "build", "ollama", "YuriiFominYoung/fable-5:latest", settings: settings); } catch { }
+        }
+        Nav.NavigateTo($"s/{s.Id}");
+    }
+
+    private async Task Delete(string id)
+    {
+        await Api.DeleteSessionAsync(id);
+        _sessions = await Api.SessionsAsync();
+    }
+
+    private static string Ago(DateTimeOffset t)
+    {
+        var d = DateTimeOffset.UtcNow - t;
+        if (d.TotalMinutes < 1) return "just now";
+        if (d.TotalHours < 1) return $"{(int)d.TotalMinutes}m ago";
+        if (d.TotalDays < 1) return $"{(int)d.TotalHours}h ago";
+        return $"{(int)d.TotalDays}d ago";
+    }
+}

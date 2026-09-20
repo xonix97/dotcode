@@ -1,0 +1,84 @@
+﻿@inherits LayoutComponentBase
+@inject DotCode.Web.Services.DotCodeApi Api
+@inject NavigationManager Nav
+
+<div class="dc-shell">
+    <aside class="dc-sidebar">
+        <div class="dc-brand"><span>◍</span> dotcode</div>
+        <div class="dc-side-scroll">
+            <div style="padding:4px;">
+                <button class="dc-btn primary" style="width:100%;" @onclick="NewSession">+ New session</button>
+            </div>
+            <div class="dc-side-label">Sessions</div>
+            @if (_sessions is null)
+            {
+                <div class="dc-session-item">loading…</div>
+            }
+            else if (_sessions.Count == 0)
+            {
+                <div class="dc-session-item">no sessions yet</div>
+            }
+            else
+            {
+                @foreach (var s in _sessions)
+                {
+                    <a class="dc-session-item @(IsActive(s.Id) ? "active" : "")" href="@($"s/{s.Id}")">
+                        @s.Title
+                        <small>@Ago(s.UpdatedAt)</small>
+                    </a>
+                }
+            }
+        </div>
+        <div class="dc-side-foot">
+            <NavLink class="dc-side-link" href="servers">🖥 See Servers</NavLink>
+            <NavLink class="dc-side-link" href="connect">🔌 Connect</NavLink>
+        </div>
+    </aside>
+    <div class="dc-main">
+        <ErrorBoundary>
+            <ChildContent>
+                @Body
+            </ChildContent>
+            <ErrorContent Context="ex">
+                <div class="dc-content"><div class="dc-card">
+                    <h3>component error</h3>
+                    <p>@ex.Message</p>
+                </div></div>
+            </ErrorContent>
+        </ErrorBoundary>
+    </div>
+</div>
+
+<DotCode.Web.Components.Chat.ToastHost />
+
+<div id="blazor-error-ui" data-nosnippet>
+    An unhandled error has occurred.
+    <a href="." class="reload">Reload</a>
+    <span class="dismiss">🗙</span>
+</div>
+
+@code {
+    private List<DotCode.Web.Services.SessionDto>? _sessions;
+
+    protected override async Task OnInitializedAsync()
+    {
+        try { _sessions = await Api.SessionsAsync(); } catch { _sessions = new(); }
+    }
+
+    private bool IsActive(string id) => Nav.Uri.Contains($"/s/{id}");
+
+    private async Task NewSession()
+    {
+        var s = await Api.CreateSessionAsync(null);
+        if (s is not null) Nav.NavigateTo($"s/{s.Id}");
+    }
+
+    private static string Ago(DateTimeOffset t)
+    {
+        var d = DateTimeOffset.UtcNow - t;
+        if (d.TotalMinutes < 1) return "just now";
+        if (d.TotalHours < 1) return $"{(int)d.TotalMinutes}m ago";
+        if (d.TotalDays < 1) return $"{(int)d.TotalHours}h ago";
+        return $"{(int)d.TotalDays}d ago";
+    }
+}

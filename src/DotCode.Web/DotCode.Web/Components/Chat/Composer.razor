@@ -1,0 +1,231 @@
+@using DotCode.Web.Services
+@inject DotCodeApi Api
+@inject SessionUiState Ui
+@inject ToastService Toasts
+
+<div class="dc-compose">
+    @if (_fileHits is not null)
+    {
+        <div class="dc-popup">
+            @for (int i = 0; i < _fileHits.Count; i++)
+            {
+                var f = _fileHits[i];
+                <button class="dc-popup-item @(i == _sel ? "sel" : "")" @onclick="() => PickFile(f)">@f</button>
+            }
+        </div>
+    }
+    @if (_showCommands)
+    {
+        <div class="dc-popup">
+            @foreach (var c in Commands.Where(c => c.Name.Contains(_cmdFilter, StringComparison.OrdinalIgnoreCase)))
+            {
+                <button class="dc-popup-item" @onclick="() => RunCommand(c.Name)">
+                    /@c.Name <small>@c.Description</small>
+                </button>
+            }
+        </div>
+    }
+    <div class="dc-prompt-box">
+        <textarea @bind="_text" @bind:event="oninput" @onkeydown="OnKeyDown"
+                  placeholder="Ask anything…  (@@ files, / commands, Tab: switch agent)" rows="3" disabled="@Busy"></textarea>
+        <div class="dc-prompt-row">
+            <button class="dc-pick" @onclick="() => _showAgents = !_showAgents">⚙ @Ui.GetAgent(SessionId)</button>
+            <button class="dc-pick" @onclick="() => _showModels = !_showModels">🤖 @ModelLabel</button>
+            <button class="dc-pick" @onclick="ToggleAuto" title="Auto-approve permissions">@(Ui.AutoApprove ? "✓ auto" : "auto")</button>
+            <span class="dc-hint">⏎ send · ⇧⏎ newline · Tab agent</span>
+            <button class="dc-btn primary" @onclick="Send" disabled="@(Busy || string.IsNullOrWhiteSpace(_text))">Send</button>
+        </div>
+    </div>
+    @if (_showAgents)
+    {
+        <div class="dc-popup" style="margin-top:8px;">
+            @foreach (var a in _agents)
+            {
+                <button class="dc-popup-item" @onclick="() => SetAgent(a)">@a <small>@(a == "plan" ? "read-only planning" : "full tools")</small></button>
+            }
+        </div>
+    }
+    @if (_showModels)
+    {
+        <div class="dc-popup" style="margin-top:8px;">
+            @if (_modelStage == ModelStage.Provider)
+            {
+                @if (_providers is null)
+                {
+                    <div class="dc-popup-item">loading providers…</div>
+                }
+                else
+                {
+                    @foreach (var p in _providers.All)
+                    {
+                        <button class="dc-popup-item" @onclick="() => PickProvider(p.Id)">
+                            @p.Name
+                            <small>@(_providers.Connected.Contains(p.Id) ? "connected" : "not connected")</small>
+                        </button>
+                    }
+                }
+            }
+            else
+            {
+                <button class="dc-popup-item muted" @onclick="() => _modelStage = ModelStage.Provider">← back to providers</button>
+                @if (_models is null)
+                {
+                    <div class="dc-popup-item">loading models…</div>
+                }
+                else if (_models.Count == 0)
+                {
+                    <div class="dc-popup-item">no models found for this provider</div>
+                }
+                else
+                {
+                    @foreach (var m in _models.Take(40))
+                    {
+                        <button class="dc-popup-item" @onclick="() => SetModel(_activeProvider, m.Id)">
+                            @m.Name
+                            <small>@(m.Free ? "free" : _activeProvider)</small>
+                        </button>
+                    }
+                }
+            }
+        </div>
+    }
+</div>
+
+@code {
+    [Parameter, EditorRequired] public string SessionId { get; set; } = "";
+    [Parameter] public bool Busy { get; set; }
+    [Parameter] public EventCallback<string> OnSend { get; set; }
+    [Parameter] public EventCallback<string> OnSlashCommand { get; set; }
+
+    private string _text = "";
+    private List<string>? _fileHits;
+    private int _sel;
+    private string _atQuery = "";
+    private bool _showCommands;
+    private string _cmdFilter = "";
+    private bool _showAgents, _showModels;
+    private ModelStage _modelStage = ModelStage.Provider;
+    private string _activeProvider = "";
+    private List<ModelDto>? _models;
+    private readonly string[] _agents = new[] { "build", "plan" };
+    private ProviderInfo? _providers;
+
+    private enum ModelStage { Provider, Model }
+
+    private string ModelLabel
+    {
+        get
+        {
+            var (p, m) = Ui.GetModel(SessionId);
+            return $"{p}/{m}";
+        }
+    }
+
+    private record Cmd(string Name, string Description);
+    private static readonly Cmd[] Commands = new[]
+    {
+        new Cmd("init", "Analyze project and create AGENTS.md"),
+        new Cmd("share", "Create a share link for this session"),
+        new Cmd("undo", "Remove the last prompt and reply"),
+        new Cmd("models", "Pick a model"),
+        new Cmd("settings", "Open session settings"),
+        new Cmd("rename", "Rename this session"),
+        new Cmd("connect", "Manage provider connections"),
+        new Cmd("abort", "Stop the running agent"),
+    };
+
+    protected override async Task OnInitializedAsync()
+    {
+        try { _providers = await Api.ProvidersAsync(); } catch { }
+    }
+
+    private async Task OnKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter" && !e.ShiftKey)
+        {
+            if (_fileHits is not null && _fileHits.Count > 0) PickFile(_fileHits[Math.Clamp(_sel, 0, _fileHits.Count - 1)]);
+            else if (_showCommands) { _showCommands = false; }
+            else { await Send(); }
+        }
+        else if (e.Key == "Tab")
+        {
+            var next = Ui.GetAgent(SessionId) == "build" ? "plan" : "build";
+            Ui.SetAgent(SessionId, next);
+        }
+        else if (e.Key == "Escape")
+        {
+            _fileHits = null; _showCommands = false; _showAgents = false; _showModels = false;
+        }
+        else if (e.Key == "ArrowDown" && _fileHits is not null) { _sel = Math.Min(_sel + 1, _fileHits.Count - 1); }
+        else if (e.Key == "ArrowUp" && _fileHits is not null) { _sel = Math.Max(_sel - 1, 0); }
+        else
+        {
+            await CheckTriggers();
+        }
+    }
+
+    private async Task CheckTriggers()
+    {
+        // @ file completion on the current token
+        var token = _text.Split([' ', '\n']).LastOrDefault() ?? "";
+        if (token.StartsWith("@") && token.Length >= 2)
+        {
+            _atQuery = token[1..];
+            try
+            {
+                _fileHits = (await Api.FindFilesAsync(_atQuery))?.Take(8).ToList();
+                _sel = 0;
+            }
+            catch { _fileHits = null; }
+        }
+        else _fileHits = null;
+
+        // / command palette at start
+        if (_text.StartsWith("/") && !_text.Contains(' ') && !_text.Contains('\n'))
+        {
+            _showCommands = true;
+            _cmdFilter = _text[1..];
+        }
+        else _showCommands = false;
+    }
+
+    private void PickFile(string f)
+    {
+        var idx = _text.LastIndexOf('@');
+        if (idx >= 0) _text = _text[..idx] + "@" + f + " ";
+        _fileHits = null;
+    }
+
+    private async Task Send()
+    {
+        if (string.IsNullOrWhiteSpace(_text)) return;
+        var t = _text;
+        _text = "";
+        await OnSend.InvokeAsync(t);
+    }
+
+    private async Task RunCommand(string name)
+    {
+        _showCommands = false;
+        _text = "";
+        await OnSlashCommand.InvokeAsync(name);
+    }
+
+    private void SetAgent(string a) { Ui.SetAgent(SessionId, a); _showAgents = false; }
+    private void SetModel(string p, string m) { Ui.SetModel(SessionId, p, m); _showModels = false; _modelStage = ModelStage.Provider; }
+    private void ToggleAuto() => Ui.AutoApprove = !Ui.AutoApprove;
+
+    private async Task PickProvider(string id)
+    {
+        _activeProvider = id;
+        _models = null;
+        _modelStage = ModelStage.Model;
+        try
+        {
+            var (models, _) = await Api.ProviderModelsAsync(id);
+            _models = models;
+            StateHasChanged();
+        }
+        catch { _models = new(); }
+    }
+}

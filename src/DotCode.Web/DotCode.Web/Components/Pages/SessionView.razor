@@ -1,0 +1,376 @@
+@page "/s/{Id}"
+@using DotCode.Web.Services
+@inject DotCodeApi Api
+@inject SessionUiState Ui
+@inject ToastService Toasts
+@inject NavigationManager Nav
+@rendermode InteractiveServer
+@implements IDisposable
+
+<PageTitle>dotcode — @_title</PageTitle>
+
+<div class="dc-topbar">
+    @if (_editing)
+    {
+        <input class="dc-input dc-rename" @bind="_editTitleText" @bind:after="SaveRename"
+               @onkeydown="RenameKey" placeholder="session title" />
+    }
+    else
+    {
+        <h1 class="dc-rename" @onclick="BeginRename" title="Click to rename">@_title</h1>
+    }
+    <div class="spacer"></div>
+    <button class="dc-btn" @onclick="() => _showSettings = !_showSettings" title="Settings">⚙ settings</button>
+    <button class="dc-btn" @onclick="Share" title="Create a share link">⤴ Share</button>
+    <button class="dc-btn" @onclick="Undo" disabled="@(!CanUndo)" title="Remove the last agent turn">↩ undo</button>
+    <button class="dc-btn danger" @onclick="Abort" disabled="@(!_busy)" title="Stop agent">■ Abort</button>
+    <button class="dc-btn danger" @onclick="Delete" title="Delete session">🗑</button>
+</div>
+
+@if (_showSettings)
+{
+    <div class="dc-settings-pop">
+        <div class="dc-side-label">session settings</div>
+        <label class="dc-check">
+            <input type="checkbox" @bind="Ui.AutoApprove" />
+            auto-approve tool permissions
+        </label>
+        <div class="dc-grid2">
+            <label class="dc-field">
+                <span>temperature</span>
+                <input class="dc-input" type="number" step="0.1" min="0" max="2" @bind="Ui.Temperature" />
+            </label>
+            <label class="dc-field">
+                <span>max steps</span>
+                <input class="dc-input" type="number" step="1" min="1" max="100" @bind="Ui.MaxSteps" />
+            </label>
+        </div>
+        <label class="dc-field" style="margin-top:10px;">
+            <span>extra instructions (appended to system prompt)</span>
+            <textarea class="dc-input" rows="3" @bind="Ui.Instructions" placeholder="e.g. always run tests after edits…"></textarea>
+        </label>
+        <div class="dc-row" style="justify-content:flex-end; margin-top:10px;">
+            <span class="dc-note">applied to the next prompt</span>
+            <button class="dc-btn primary" @onclick="() => _showSettings = false">Done</button>
+        </div>
+    </div>
+}
+
+<div class="dc-content">
+    @if (_threads is null)
+    {
+        <div class="dc-empty">loading…</div>
+    }
+    else if (_threads.Count == 0)
+    {
+        <div class="dc-empty">Ask anything to get started.<br />Use <b>@@</b> to attach files, <b>/</b> for commands.</div>
+    }
+    else
+    {
+        <div class="dc-thread">
+            @foreach (var t in _threads)
+            {
+                @if (t.Info.Role == "user")
+                {
+                    <div class="dc-user">
+                        @UserText(t)
+                        <button class="dc-revert" title="Revert session to before this message" @onclick="() => Revert(t.Info.Id)">⏪</button>
+                    </div>
+                }
+                else
+                {
+                    <MessageView Thread="@t" />
+                }
+            }
+        </div>
+    }
+</div>
+
+<div class="dc-compose-wrap">
+    @if (_busy)
+    {
+        <div class="dc-busy">
+            <span class="dc-spin">◍</span> agent is working
+            @if (_partCount > 0)
+            {
+                <span class="dc-parts">· @_partCount part@(_partCount == 1 ? "" : "s") streamed</span>
+            }
+            <span class="dc-live">· live</span>
+        </div>
+    }
+    @if (_todos is { Count: > 0 })
+    {
+        <div class="dc-todos">
+            <span class="dc-side-label">todos</span>
+            @foreach (var t in _todos)
+            {
+                <span class="dc-pill @(t.Done ? "ok" : "muted")">@(t.Done ? "☑" : "☐") @t.Content</span>
+            }
+        </div>
+    }
+    <Composer SessionId="@Id" Busy="@_busy" OnSend="Send" OnSlashCommand="Slash" />
+    <div class="dc-status">
+        <span>@_projectName</span>
+        <span class="right"><span>agent <b>@Ui.GetAgent(Id)</b></span><span>model <b>@ModelLabel</b></span>@if (Ui.AutoApprove){<span class="dc-auto">auto</span>}</span>
+    </div>
+</div>
+
+@code {
+    [Parameter] public string Id { get; set; } = "";
+    private List<ThreadDto>? _threads;
+    private List<TodoDto>? _todos;
+    private string _title = "session";
+    private string _projectName = "";
+    private bool _busy;
+    private bool _showSettings;
+    private bool _editing;
+    private string _editTitleText = "";
+    private CancellationTokenSource? _sseCts;
+    private int _partCount;
+
+    private string ModelLabel
+    {
+        get
+        {
+            var (p, m) = Ui.GetModel(Id);
+            return $"{p}/{m}";
+        }
+    }
+
+    private bool CanUndo
+    {
+        get
+        {
+            if (_threads is not { Count: >= 2 } list) return false;
+            // last user + last assistant turn, and the assistant part count is known (turn finished)
+            var last = list[^1];
+            var prev = list[^2];
+            return last.Info.Role == "assistant" && prev.Info.Role == "user" && !last.Info.Id.StartsWith("local-");
+        }
+    }
+
+    protected override async Task OnParametersSetAsync()
+    {
+        await Refresh();
+        await LoadTodos();
+        try
+        {
+            var s = await Api.GetSessionAsync(Id);
+            if (s is not null) _title = s.Title;
+            var p = await Api.CurrentProjectAsync();
+            if (p is not null) _projectName = p.Name;
+        }
+        catch { }
+    }
+
+    protected override void OnAfterRender(bool firstRender)
+    {
+        if (firstRender) SubscribeEvents();
+    }
+
+    // ---- live updates: SSE stream from the server, debounced refresh ----
+    private void SubscribeEvents()
+    {
+        _sseCts = new CancellationTokenSource();
+        _ = EventLoop(_sseCts.Token);
+    }
+
+    private async Task EventLoop(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try { await Api.StreamEventsAsync(OnServerEvent, ct); }
+            catch { }
+            try { await Task.Delay(2000, ct); } catch (TaskCanceledException) { return; }
+        }
+    }
+
+    private bool _refreshQueued;
+    private async Task OnServerEvent(string type, string sessionId)
+    {
+        if (!string.IsNullOrEmpty(sessionId) && sessionId != Id) return;
+        if (_refreshQueued) return;
+        _refreshQueued = true;
+        try { await Task.Delay(120); } catch { _refreshQueued = false; return; }
+        _refreshQueued = false;
+        await Refresh();
+        await LoadTodos();
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task Refresh()
+    {
+        try
+        {
+            _threads = await Api.MessagesAsync(Id);
+            var last = _threads?.LastOrDefault(t => t.Info.Role == "assistant" && !t.Info.Id.StartsWith("local-"));
+            _partCount = last?.Parts.Count ?? 0;
+        }
+        catch { _threads = new(); }
+    }
+
+    private async Task LoadTodos()
+    {
+        try { _todos = await Api.TodosAsync(Id); } catch { _todos = new(); }
+    }
+
+    private static string UserText(ThreadDto t)
+        => string.Join("\n", t.Parts.Where(p => p.Type == "text").Select(p => p.Text ?? ""));
+
+    private async Task Send(string text)
+    {
+        if (_busy) return;
+        _busy = true;
+        _partCount = 0;
+
+        // Optimistic: show the prompt immediately with a thinking placeholder.
+        // Real parts (thinking, tools, text) stream in live via the SSE event loop.
+        var now = DateTimeOffset.UtcNow;
+        var agent = Ui.GetAgent(Id);
+        _threads ??= new();
+        _threads.Add(new ThreadDto(
+            new MessageDto($"local-u{now.Ticks}", Id, "user", agent, null, now),
+            new List<PartDto>
+            {
+                new($"local-p{now.Ticks}", $"local-u{now.Ticks}", "text", text, null, null, null, null, false),
+            }));
+        _threads.Add(new ThreadDto(
+            new MessageDto($"local-a{now.Ticks}", Id, "assistant", agent, ModelLabel, now.AddMilliseconds(1)),
+            new List<PartDto>
+            {
+                new($"local-tp{now.Ticks}", $"local-a{now.Ticks}", "thinking", "thinking…", null, null, null, null, false),
+            }));
+        StateHasChanged();
+
+        try
+        {
+            var (provider, model) = Ui.GetModel(Id);
+            await Api.PostMessageAsync(Id, text, agent, provider, model, Ui.AutoApprove, Ui.ToSettings());
+            await Refresh();
+            await LoadTodos();
+        }
+        catch (Exception ex)
+        {
+            Toasts.Show($"send failed: {ex.Message}", "error");
+        }
+        finally
+        {
+            _busy = false;
+            await Refresh();
+            StateHasChanged();
+        }
+    }
+
+    private async Task Undo()
+    {
+        if (!CanUndo || _threads is null) return;
+        var lastUser = _threads[^2].Info.Id;
+        // Revert the user turn: removes the prompt + the assistant reply after it.
+        var ok = await Api.RevertAsync(Id, lastUser);
+        Toasts.Show(ok ? "undone — last prompt and reply removed" : "undo failed", ok ? "success" : "error");
+        await Refresh();
+        StateHasChanged();
+    }
+
+    private async Task Revert(string messageId)
+    {
+        var ok = await Api.RevertAsync(Id, messageId);
+        Toasts.Show(ok ? "reverted — later messages removed" : "revert failed", ok ? "success" : "error");
+        await Refresh();
+        StateHasChanged();
+    }
+
+    private async Task InitProject()
+    {
+        Toasts.Show("analyzing project…");
+        try
+        {
+            await Api.PostMessageAsync(Id, "/init: Analyze this project and write an AGENTS.md file at the root describing the codebase: purpose, structure, build & test commands, and conventions an AI coding agent should follow.", Ui.GetAgent(Id), Ui.GetModel(Id).Provider, Ui.GetModel(Id).Model, autoApprove: true, Ui.ToSettings());
+            Toasts.Show("AGENTS.md analysis started", "success");
+        }
+        catch (Exception ex) { Toasts.Show($"init failed: {ex.Message}", "error"); }
+    }
+
+    private void BeginRename() { _editTitleText = _title; _editing = true; }
+
+    private async Task SaveRename()
+    {
+        _editing = false;
+        var t = _editTitleText.Trim();
+        if (string.IsNullOrWhiteSpace(t) || t == _title) return;
+        try
+        {
+            await Api.RenameSessionAsync(Id, t);
+            _title = t;
+            Toasts.Show("renamed", "success");
+        }
+        catch (Exception ex) { Toasts.Show($"rename failed: {ex.Message}", "error"); }
+    }
+
+    private async Task RenameKey(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter") await SaveRename();
+        else if (e.Key == "Escape") _editing = false;
+    }
+
+    private async Task Slash(string cmd)
+    {
+        switch (cmd)
+        {
+            case "abort":
+                await Api.AbortAsync(Id);
+                Toasts.Show("abort requested");
+                break;
+            case "share":
+                await Share();
+                break;
+            case "rename":
+                BeginRename();
+                break;
+            case "undo":
+                await Undo();
+                break;
+            case "init":
+                await InitProject();
+                break;
+            case "models":
+                Toasts.Show("use the 🤖 picker below to change model");
+                break;
+            case "connect":
+                Nav.NavigateTo("connect");
+                break;
+            case "settings":
+                _showSettings = !_showSettings;
+                StateHasChanged();
+                break;
+            default:
+                Toasts.Show($"/{cmd} is not implemented yet");
+                break;
+        }
+    }
+
+    private async Task Share()
+    {
+        try
+        {
+            var ok = await Api.ShareAsync(Id);
+            Toasts.Show(ok ? "share snapshot created (stays local in this build)" : "share failed", ok ? "success" : "error");
+        }
+        catch (Exception ex) { Toasts.Show($"share failed: {ex.Message}", "error"); }
+    }
+
+    private async Task Abort()
+    {
+        await Api.AbortAsync(Id);
+        Toasts.Show("abort requested");
+    }
+
+    private async Task Delete()
+    {
+        _sseCts?.Cancel();
+        await Api.DeleteSessionAsync(Id);
+        Nav.NavigateTo("/");
+    }
+
+    public void Dispose() => _sseCts?.Cancel();
+}

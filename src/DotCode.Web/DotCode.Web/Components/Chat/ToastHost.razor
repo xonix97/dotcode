@@ -1,0 +1,28 @@
+@inject DotCode.Web.Services.ToastService Toasts
+@implements IDisposable
+
+<div class="dc-toasts">
+    @foreach (var t in _items)
+    {
+        <div class="dc-toast @t.Variant">@t.Message</div>
+    }
+</div>
+
+@code {
+    private readonly List<(string Message, string Variant)> _items = new();
+
+    protected override void OnInitialized() => Toasts.OnToast += Push;
+
+    private void Push(string message, string variant)
+    {
+        _items.Add((message, variant));
+        StateHasChanged();
+        _ = Task.Delay(5000).ContinueWith(_ => InvokeAsync(() =>
+        {
+            if (_items.Count > 0) _items.RemoveAt(0);
+            StateHasChanged();
+        }));
+    }
+
+    public void Dispose() => Toasts.OnToast -= Push;
+}

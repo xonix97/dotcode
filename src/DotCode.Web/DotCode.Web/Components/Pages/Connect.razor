@@ -1,0 +1,284 @@
+@page "/connect"
+@using DotCode.Web.Services
+@using System.Diagnostics
+@inject DotCodeApi Api
+@inject ToastService Toasts
+@rendermode InteractiveServer
+
+<PageTitle>dotcode — connect</PageTitle>
+
+<div class="dc-topbar">
+    <h1>Connect a provider</h1>
+</div>
+
+<div class="dc-content">
+    <div class="dc-center">
+        @if (_antigravityInfo is not null)
+        {
+            <div class="dc-card dc-free-spot">
+                <h3>◍ Google Antigravity <span class="dc-pill ok">free tier</span></h3>
+                <p>Sign in with your Google account and get Gemini models. The key also works for the
+                   <code>google</code> provider (same credential, both stay connected).</p>
+                <div class="dc-row">
+                    <button class="dc-btn primary" @onclick="ConnectAntigravity">Connect Antigravity</button>
+                    @if (_providers?.Connected.Contains("antigravity") == true)
+                    {
+                        <span class="dc-pill ok">connected</span>
+                    }
+                </div>
+                <div class="dc-row" style="margin-top:10px;">
+                    <input class="dc-input" type="password" placeholder="paste Google AI Studio key…" @bind="_antigravityKey" />
+                    <button class="dc-btn" @onclick="SaveAntigravityKey">Save key</button>
+                </div>
+                <p class="dc-note">@_antigravityInfo.Instructions</p>
+            </div>
+        }
+
+        <div class="dc-card">
+            <h3>◍ DotCode Gateway <span class="dc-pill">zero-config · 500+ models</span></h3>
+            <p>Sign in once — like Kilo Gateway. Paste the token from your browser flow:</p>
+            <div class="dc-row">
+                <input class="dc-input" placeholder="paste gateway token…" @bind="_gatewayToken" />
+                <button class="dc-btn primary" @onclick="SaveGateway">Connect</button>
+            </div>
+        </div>
+
+        <div class="dc-side-label">Custom provider — baseURL + API key + model id</div>
+        <div class="dc-card">
+            <p>Works with any OpenAI-compatible endpoint: vLLM, llama.cpp server, LM Studio (remote), Together, Fireworks, DeepSeek, xAI, your own proxy…</p>
+            <div class="dc-grid2">
+                <label class="dc-field"><span>display name</span>
+                    <input class="dc-input" placeholder="My proxy" @bind="_customName" />
+                </label>
+                <label class="dc-field"><span>base URL</span>
+                    <input class="dc-input" placeholder="https://api.example.com/v1" @bind="_customBaseUrl" />
+                </label>
+            </div>
+            <div class="dc-grid2" style="margin-top:8px;">
+                <label class="dc-field"><span>api key (optional)</span>
+                    <input class="dc-input" type="password" placeholder="sk-…" @bind="_customApiKey" />
+                </label>
+                <label class="dc-field"><span>default model id</span>
+                    <input class="dc-input" placeholder="e.g. deepseek-chat" @bind="_customModel" />
+                </label>
+            </div>
+            <div class="dc-row" style="margin-top:10px; justify-content:flex-end;">
+                <span class="dc-note">saved to ~/.config/dotcode/auth.json + dotcode.json</span>
+                <button class="dc-btn primary" @onclick="SaveCustom" disabled="@(!_customCanSave)">Add provider</button>
+            </div>
+            @if (_customs.Count > 0)
+            {
+                <div class="dc-pills" style="margin-top:10px;">
+                    @foreach (var c in _customs)
+                    {
+                        <span class="dc-pill ok">@c.Name · @c.BaseUrl</span>
+                    }
+                </div>
+            }
+        </div>
+
+        <div class="dc-side-label">Free tiers — no credit card</div>
+        <div class="dc-grid2">
+            @foreach (var id in new[] { "9router", "google", "groq", "mistral", "cerebras", "github-models", "openrouter" })
+            {
+                var p = _providers?.All.FirstOrDefault(x => x.Id == id);
+                if (p is null) continue;
+                var connected = _providers?.Connected.Contains(id) == true;
+                <div class="dc-card">
+                    <div class="dc-row">
+                        <h3 style="flex:1;">@p.Name</h3>
+                        @if (connected)
+                        {
+                            <span class="dc-pill ok">connected</span>
+                        }
+                        else
+                        {
+                            <span class="dc-pill muted">not connected</span>
+                        }
+                    </div>
+                    <div class="dc-row">
+                        <input class="dc-input" type="password" placeholder="@($"paste {id} key…")" @bind="_keys[id]" />
+                        <button class="dc-btn" @onclick="() => SaveKey(id)">Save</button>
+                    </div>
+                    @if (_providers?.KeyUrls?.TryGetValue(id, out var keyUrl) == true && keyUrl is not null)
+                    {
+                        <p class="dc-note"><a href="@keyUrl" target="_blank" rel="noopener">Get a free key ↗</a></p>
+                    }
+                    @if (_modelPills.TryGetValue(id, out var pills))
+                    {
+                        <div class="dc-pills">
+                            @foreach (var m in pills.Take(4))
+                            {
+                                <span class="dc-pill @(m.Free ? "ok" : "muted")">@m.Id</span>
+                            }
+                        </div>
+                    }
+                </div>
+            }
+        </div>
+
+        <div class="dc-side-label">Local — no key needed</div>
+        <div class="dc-grid2">
+            @foreach (var id in new[] { "ollama", "lmstudio" })
+            {
+                var p = _providers?.All.FirstOrDefault(x => x.Id == id);
+                if (p is null) continue;
+                <div class="dc-card">
+                    <div class="dc-row">
+                        <h3 style="flex:1;">@p.Name</h3>
+                        <span class="dc-pill ok">local</span>
+                    </div>
+                    @if (_modelPills.TryGetValue(id, out var pills))
+                    {
+                        <div class="dc-pills">
+                            @foreach (var m in pills.Take(4))
+                            {
+                                <span class="dc-pill muted">@m.Id</span>
+                            }
+                        </div>
+                    }
+                </div>
+            }
+        </div>
+
+        <div class="dc-side-label">Bring your own key</div>
+        @foreach (var p in _providers?.All.Where(x => x.Id is "openai" or "anthropic" or "azure") ?? Enumerable.Empty<ProviderDto>())
+        {
+            var connected = _providers?.Connected.Contains(p.Id) == true;
+            <div class="dc-card">
+                <div class="dc-row">
+                    <h3 style="flex:1;">@p.Name</h3>
+                    @if (connected)
+                    {
+                        <span class="dc-pill ok">connected</span>
+                    }
+                    else
+                    {
+                        <span class="dc-pill muted">not connected</span>
+                    }
+                </div>
+                <div class="dc-row">
+                    <input class="dc-input" type="password" placeholder="@($"paste {p.Id} key…")" @bind="_keys[p.Id]" />
+                    <button class="dc-btn" @onclick="() => SaveKey(p.Id)">Save</button>
+                </div>
+                @if (_providers?.KeyUrls?.TryGetValue(p.Id, out var keyUrl2) == true && keyUrl2 is not null)
+                {
+                    <p class="dc-note"><a href="@keyUrl2" target="_blank" rel="noopener">Get a key ↗</a></p>
+                }
+            </div>
+        }
+
+        <p class="dc-sub">Keys are stored in <code>~/.config/dotcode/auth.json</code>, never in project config. CLI: <code>dotcode auth list</code></p>
+    </div>
+</div>
+
+@code {
+    private ProviderInfo? _providers;
+    private string _gatewayToken = "";
+    private string _antigravityKey = "";
+    private DotCodeApi.OAuthInfo? _antigravityInfo;
+    private readonly Dictionary<string, string> _keys = new();
+    private readonly Dictionary<string, List<ModelDto>> _modelPills = new();
+
+    // custom provider form
+    private string _customName = "", _customBaseUrl = "", _customApiKey = "", _customModel = "";
+    private List<DotCodeApi.CustomProviderDto> _customs = new();
+    private bool _customCanSave => !string.IsNullOrWhiteSpace(_customName) && !string.IsNullOrWhiteSpace(_customBaseUrl);
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            _providers = await Api.ProvidersAsync();
+            if (_providers is not null)
+                foreach (var p in _providers.All) _keys[p.Id] = "";
+            try { _antigravityInfo = await Api.OAuthAuthorizeAsync("antigravity"); }
+            catch { _antigravityInfo = new DotCodeApi.OAuthInfo("https://aistudio.google.com/apikey", "Sign in with Google, create an API key, paste it back."); }
+            try { _customs = await Api.GetCustomProvidersAsync() ?? new(); } catch { }
+            foreach (var id in new[] { "9router", "google", "antigravity", "groq", "mistral", "cerebras", "github-models", "openrouter", "ollama", "lmstudio" })
+                await LoadPills(id);
+        }
+        catch (Exception ex) { Toasts.Show($"providers failed: {ex.Message}", "error"); }
+    }
+
+    private async Task LoadPills(string id)
+    {
+        try
+        {
+            var (models, source) = await Api.ProviderModelsAsync(id);
+            if (models.Count > 0) _modelPills[id] = models;
+            if (source == "live") _liveSources.Add(id);
+        }
+        catch { }
+    }
+
+    private readonly HashSet<string> _liveSources = new();
+
+    private void ConnectAntigravity()
+    {
+        try
+        {
+            if (_antigravityInfo is not null)
+            {
+                Process.Start(new ProcessStartInfo(_antigravityInfo.Url) { UseShellExecute = true });
+                Toasts.Show("opened browser — sign in with Google, then paste the key");
+            }
+        }
+        catch { Toasts.Show($"open {_antigravityInfo?.Url} in your browser", "info"); }
+    }
+
+    private async Task SaveAntigravityKey()
+    {
+        if (string.IsNullOrWhiteSpace(_antigravityKey)) { Toasts.Show("paste a key first", "error"); return; }
+        if (await Api.OAuthCallbackAsync("antigravity", _antigravityKey.Trim()))
+        {
+            Toasts.Show("antigravity + google connected", "success");
+            _antigravityKey = "";
+            _providers = await Api.ProvidersAsync();
+        }
+        else Toasts.Show("save failed", "error");
+    }
+
+    private async Task SaveKey(string provider)
+    {
+        if (!_keys.TryGetValue(provider, out var key) || string.IsNullOrWhiteSpace(key))
+        {
+            Toasts.Show("paste a key first", "error");
+            return;
+        }
+        if (await Api.PutAuthAsync(provider, key.Trim()))
+        {
+            Toasts.Show($"{provider} connected", "success");
+            _keys[provider] = "";
+            _providers = await Api.ProvidersAsync();
+        }
+        else Toasts.Show($"{provider} save failed", "error");
+    }
+
+    private async Task SaveCustom()
+    {
+        try
+        {
+            var r = await Api.AddCustomProviderAsync(_customName.Trim(), _customBaseUrl.Trim(), _customApiKey, _customModel.Trim());
+            if (r is not null)
+            {
+                Toasts.Show($"provider '{r.Name}' added — pick it in the 🤖 picker", "success");
+                _customName = _customBaseUrl = _customApiKey = _customModel = "";
+                _customs = await Api.GetCustomProvidersAsync() ?? new();
+            }
+        }
+        catch (Exception ex) { Toasts.Show($"add failed: {ex.Message}", "error"); }
+    }
+
+    private async Task SaveGateway()
+    {
+        if (string.IsNullOrWhiteSpace(_gatewayToken)) { Toasts.Show("paste a token first", "error"); return; }
+        if (await Api.PutAuthAsync("dotcode-gateway", _gatewayToken))
+        {
+            Toasts.Show("gateway connected", "success");
+            _gatewayToken = "";
+            _providers = await Api.ProvidersAsync();
+        }
+        else Toasts.Show("gateway save failed", "error");
+    }
+}
