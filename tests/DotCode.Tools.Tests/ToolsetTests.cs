@@ -31,9 +31,34 @@ public sealed class ToolsetTests : IDisposable
     public void Edit_ReplacesExactlyOnce()
     {
         _tools.Write("b.txt", "foo bar foo");
-        Assert.StartsWith("Error", _tools.Edit("b.txt", "foo", "baz"));
+        _tools.BeginTurn();
+        // read-before-edit guard: editing without a fresh Read must fail
+        Assert.StartsWith("Error: read", _tools.Edit("b.txt", "foo", "baz"));
+        Assert.StartsWith("1:", _tools.Read("b.txt"));
+        Assert.StartsWith("Error", _tools.Edit("b.txt", "foo", "baz")); // ambiguous: 2 matches
         Assert.StartsWith("OK", _tools.Edit("b.txt", "foo", "baz", replaceAll: true));
         Assert.Contains("baz bar baz", _tools.Read("b.txt", limit: 5));
+    }
+
+    [Fact]
+    public void Write_ExistingFile_RequiresReadFirst()
+    {
+        Assert.StartsWith("OK", _tools.Write("c.txt", "v1"));
+        _tools.BeginTurn();
+        Assert.StartsWith("Error:", _tools.Write("c.txt", "v2")); // exists, not read this turn
+        _tools.Read("c.txt");
+        Assert.StartsWith("OK", _tools.Write("c.txt", "v2"));
+        Assert.Contains("v2", _tools.Read("c.txt"));
+    }
+
+    [Fact]
+    public void Tree_ListsWorkspaceEntries()
+    {
+        _tools.Write("src/deep/code.cs", "class C {}");
+        var tree = _tools.Tree(".", depth: 3);
+        Assert.Contains("src/", tree);
+        Assert.Contains(Path.Combine("src", "deep") + "/", tree);
+        Assert.Contains(Path.Combine("src", "deep", "code.cs"), tree);
     }
 
     [Fact]
@@ -67,12 +92,13 @@ public sealed class ToolsetTests : IDisposable
     }
 
     [Fact]
-    public void AsAITools_ExposesEightFunctions()
+    public void AsAITools_ExposesTenFunctions()
     {
         var tools = _tools.AsAITools();
-        Assert.Equal(8, tools.Count);
+        Assert.Equal(10, tools.Count);
         Assert.Contains(tools, t => t.Name.Equals("Read", StringComparison.OrdinalIgnoreCase));
         Assert.Contains(tools, t => t.Name.Equals("Bash", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(tools, t => t.Name.Equals("Tree", StringComparison.OrdinalIgnoreCase));
         Assert.Contains(tools, t => t.Name.Equals("TodoWrite", StringComparison.OrdinalIgnoreCase));
         Assert.Contains(tools, t => t.Name.Equals("TodoRead", StringComparison.OrdinalIgnoreCase));
     }
