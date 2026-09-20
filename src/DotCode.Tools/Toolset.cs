@@ -33,8 +33,15 @@ public sealed class DotCodeToolset(Workspace workspace)
     private const int MaxBashOutputChars = 30_000;
     private const int MaxBashTimeoutMs = 300_000;
 
+    /// <summary>True once TodoWrite has been called this turn (weak-model plan-first gate).</summary>
+    public bool HasPlan { get; private set; }
+
     /// <summary>Resets per-turn state (call at the start of each agent turn).</summary>
-    public void BeginTurn() => _readFiles.Clear();
+    public void BeginTurn()
+    {
+        _readFiles.Clear();
+        HasPlan = false;
+    }
 
     /// <summary>Sets the session context so TodoWrite/TodoRead hit the right list. Returns this for chaining.</summary>
     public DotCodeToolset WithSession(DotCode.Core.Sessions.ITodoStore? todoStore, string? sessionId)
@@ -239,6 +246,7 @@ public sealed class DotCodeToolset(Workspace workspace)
         var list = todos.Select(t => new DotCode.Core.Models.Todo(
             Guid.NewGuid().ToString("n")[..8], _sessionId, t.content, t.done)).ToList();
         _todoStore.ReplaceAll(_sessionId, list);
+        HasPlan = true;
         return $"OK: {list.Count} todo(s) saved.";
     }
 
@@ -259,7 +267,7 @@ public sealed class DotCodeToolset(Workspace workspace)
 
     public IReadOnlyList<AITool> AsAITools() =>
         GetType().GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.DeclaredOnly)
-            .Where(m => m.Name is not nameof(AsAITools) and not nameof(WithSession))
+            .Where(m => m.Name is not nameof(AsAITools) and not nameof(WithSession) and not nameof(BeginTurn))
             .Select(m => (AITool)AIFunctionFactory.Create(m, this))
             .ToList();
 

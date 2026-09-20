@@ -480,11 +480,38 @@ static object ListDir(string dir)
     catch { return new List<object>(); }
 }
 
-/// <summary>Holds the active workspace root; changed at runtime via POST /project/select.</summary>
+/// <summary>Holds the active workspace root; changed at runtime via POST /project/select.
+/// The choice persists across restarts via a marker file in the dotcode data dir.</summary>
 public sealed class WorkspaceState(string initialRoot)
 {
-    public string Root { get; private set; } = Path.GetFullPath(initialRoot);
-    public void SetRoot(string path) => Root = Path.GetFullPath(path);
+    private static readonly string MarkerPath = Path.Combine(
+        DotCode.Core.Sessions.FileSessionStore.DataDir(), "workspace.txt");
+
+    public string Root { get; private set; } = LoadRoot(initialRoot);
+
+    public void SetRoot(string path)
+    {
+        Root = Path.GetFullPath(path);
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(MarkerPath)!);
+            File.WriteAllText(MarkerPath, Root);
+        }
+        catch { }
+    }
+
+    private static string LoadRoot(string fallback)
+    {
+        try
+        {
+            if (File.Exists(MarkerPath)
+                && File.ReadAllText(MarkerPath).Trim() is { Length: > 0 } saved
+                && Directory.Exists(saved))
+                return saved;
+        }
+        catch { }
+        return Path.GetFullPath(fallback);
+    }
 }
 
 public sealed record StoreEvent(string Type, string SessionId, DateTimeOffset At);

@@ -24,6 +24,20 @@ public sealed class AgentService(string workspaceRoot, int maxSteps = 25)
     private static readonly HashSet<string> ReadOnlyTools = new(StringComparer.OrdinalIgnoreCase)
         { "Read", "Glob", "Grep", "TodoRead", "Tree" };
 
+    /// <summary>Mutating tools that weak models must not touch before making a plan.</summary>
+    private static readonly HashSet<string> MutatingTools = new(StringComparer.OrdinalIgnoreCase)
+        { "Edit", "Write", "Bash", "TodoWrite" };
+
+    /// <summary>Models that typically need scaffolding: small local models with weak tool-calling.
+    /// Matched against the model id; provider-agnostic.</summary>
+    public static bool IsWeakModel(string providerId, string modelId)
+    {
+        var m = $"{providerId}/{modelId}".ToLowerInvariant();
+        foreach (var marker in new[] { "gpt-oss-20b", "gpt-oss:20b", "gpt-oss-7b", "3.8b", "7b", "8b", "13b", "-3b", "1.5b", "1b", "qwen2.5-7b", "llama3.1-8b", "phi-3", "phi-4-mini", "gemma-2-9b", "gemma-3-4b", "ministral-3b", "nano-9b" })
+            if (m.Contains(marker)) return true;
+        return false;
+    }
+
     public static string BuildSystemPrompt(string agentName, string workspaceRoot)
     {
         var sb = new StringBuilder();
@@ -109,6 +123,30 @@ public sealed class AgentService(string workspaceRoot, int maxSteps = 25)
         return sb.ToString();
     }
 
+    /// <summary>Extra structure for weak tool-callers: one step at a time, plan first, exact call format.</summary>
+    public static string BuildWeakModelScaffold(string[] toolNames)
+    {
+        var toolList = string.Join(", ", toolNames);
+        return """
+
+            # WORK PROTOCOL (follow exactly)
+            You are working with limited reasoning capacity, so strict discipline is mandatory:
+
+            1. BEFORE ANY Edit/Write/Bash on a task: call TodoWrite first with a short numbered plan.
+            2. Do EXACTLY ONE tool call per message. Wait for its result. Never batch.
+            3. Before Edit: Read the target file. Copy oldString EXACTLY from what Read returned.
+            4. After every Write/Edit of code, run the project's build or tests with Bash.
+            5. When the todo list is all done, reply with a SHORT final answer (what changed + verification). No tool call in that message.
+
+            # TOOL CALL FORMAT (critical)
+            One tool call per assistant message, as native JSON:
+            {"name": "ToolName", "arguments": {"param": "value"}}
+            Available tools: TOOLSLIST.
+            NEVER write tool calls as prose or code fences. NEVER invent tools. NEVER emit two calls in one message.
+            If a call fails, read the error, fix the arguments, retry the SAME step once, then adjust the plan.
+            """.Replace("TOOLSLIST", toolList);
+    }
+
     public async Task<(string AssistantMessageId, string Text)> CompleteAsync(
         string providerId, string modelId, string agentName,
         IReadOnlyList<(string Role, string Text)> history,
@@ -138,7 +176,13 @@ public sealed class AgentService(string workspaceRoot, int maxSteps = 25)
             : allTools;
         var toolMap = tools.OfType<AIFunction>().ToDictionary(t => t.Name, t => t);
 
-        var messages = new List<ChatMessage> { new(ChatRole.System, BuildSystemPrompt(agentName, _workspaceRoot)) };
+        // Weak models get scaffolding: stricter protocol, plan-first gate, one-call-at-a-time.
+        bool weak = !planMode && IsWeakModel(providerId, modelId);
+
+        var systemPrompt = BuildSystemPrompt(agentName, _workspaceRoot);
+        if (weak)
+            systemPrompt += BuildWeakModelScaffold([.. toolMap.Keys.OrderBy(k => k, StringComparer.OrdinalIgnoreCase)]);
+        var messages = new List<ChatMessage> { new(ChatRole.System, systemPrompt) };
         foreach (var (role, text) in TrimHistory(history))
         {
             var chatRole = role.Equals("assistant", StringComparison.OrdinalIgnoreCase) ? ChatRole.Assistant
@@ -151,6 +195,7 @@ public sealed class AgentService(string workspaceRoot, int maxSteps = 25)
                 messages[0].Text + "\n\nAdditional instructions from the user for this session (highest priority):\n" + instructions);
 
         var stepLimit = maxSteps is > 0 ? maxSteps.Value : _maxSteps;
+        if (weak && stepLimit < 40) stepLimit = Math.Min(stepLimit * 2, 60); // weak models need more, smaller steps
         var options = new ChatOptions
         {
             Tools = [.. tools],
@@ -172,8 +217,41 @@ public sealed class AgentService(string workspaceRoot, int maxSteps = 25)
                         "Step budget nearly exhausted. Wrap up NOW without tools: state what changed (files), what was verified, what remains. Be brief."));
                 }
 
-                var response = await GetResponseWithRetryAsync(client, messages, stepOptions, ct);
+                ChatResponse response;
+                try
+                {
+                    response = await GetResponseWithRetryAsync(client, messages, stepOptions, ct);
+                }
+                catch (Exception ex) when (ex.Message.Contains("FinishReason", StringComparison.OrdinalIgnoreCase)
+                    || ex.Message.Contains("malformed_function_call", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Gemini/others emit finish reasons the SDK cannot map (e.g. malformed_function_call).
+                    // Treat as a bad generation: ask the model to retry with the exact call format.
+                    messages.Add(new ChatMessage(ChatRole.User,
+                        "Your last message could not be parsed as a tool call. Re-send it using EXACTLY one native " +
+                        "tool call with valid JSON arguments — no prose around it."));
+                    store?.AppendAssistantTextPart(assistantId, "(harness: malformed tool call — requesting retry)");
+                    continue;
+                }
                 var calls = response.Messages.SelectMany(m => m.Contents.OfType<FunctionCallContent>()).ToList();
+
+                // Weak-model recovery: the model wrote a tool call as plain text instead of a native call.
+                (string Name, JsonElement Arguments)? parsed = calls.Count == 0 && weak && step < stepLimit - 1
+                    ? ParseTextToolCall(response.Text)
+                    : null;
+                if (parsed is not null)
+                {
+                    var (rName, rArgs) = parsed.Value;
+                    var fixedName = RepairToolName(rName, toolMap.Keys) ?? rName;
+                    calls.Add(new FunctionCallContent(Guid.NewGuid().ToString("n")[..12], fixedName,
+                        JsonSerializer.Deserialize<Dictionary<string, object?>>(rArgs.GetRawText()) ?? new()));
+                    // Replace the raw text (which the user should not see as an answer) with a neutral marker.
+                    var fake = new ChatMessage { Role = ChatRole.Assistant };
+                    fake.Contents.Add(new FunctionCallContent(calls[0].CallId ?? "", fixedName, calls[0].Arguments));
+                    messages.RemoveAt(messages.Count - 1);
+                    messages.Add(fake);
+                    store?.AppendAssistantTextPart(assistantId, $"(tool call recovered from text: {fixedName})");
+                }
 
                 // Persist the model's reasoning text before tool runs so the UI shows it live.
                 if (calls.Count > 0 && !string.IsNullOrWhiteSpace(response.Text))
@@ -185,6 +263,22 @@ public sealed class AgentService(string workspaceRoot, int maxSteps = 25)
                     finalText = response.Text.Trim();
                     if (!string.IsNullOrEmpty(finalText)) break;
                     continue;
+                }
+
+                // Weak models: exactly one call per step (their batching is unreliable),
+                // and a plan-first gate on mutating tools.
+                if (weak && calls.Count > 1)
+                    calls = [calls[0]];
+                if (weak && calls.Count == 1)
+                {
+                    var cn = calls[0].Name ?? "";
+                    if (MutatingTools.Contains(cn) && cn != "TodoWrite" && !toolset.HasPlan)
+                    {
+                        var ask = "Before changing files you must plan. Call TodoWrite now with a short numbered plan for this task, then continue step by step.";
+                        messages.Add(new ChatMessage(ChatRole.User, ask));
+                        store?.AppendAssistantTextPart(assistantId, "(harness: requesting plan first)");
+                        continue;
+                    }
                 }
 
                 // Execute independent tool calls in parallel (OpenCode-style batching).
@@ -200,10 +294,23 @@ public sealed class AgentService(string workspaceRoot, int maxSteps = 25)
 
                     if (!toolMap.TryGetValue(toolName, out var fn))
                     {
-                        var err = $"Error: unknown tool '{toolName}'. Available: {string.Join(", ", toolMap.Keys.OrderBy(k => k))}";
-                        results[idx] = new FunctionResultContent(call.CallId ?? "", err);
-                        store?.AppendToolResult(assistantId, recorded?.CallId ?? call.CallId ?? "", toolName, err, true);
-                        return;
+                        // Fuzzy-repair common weak-model tool-name mistakes.
+                        var repaired = RepairToolName(toolName, toolMap.Keys);
+                        if (repaired is not null && toolMap.TryGetValue(repaired, out var fixedFn))
+                        {
+                            fn = fixedFn;
+                            toolName = repaired;
+                        }
+                        else
+                        {
+                            var schema = fn is null && toolMap.Count > 0
+                                ? ""
+                                : "";
+                            var err = $"Error: unknown tool '{toolName}'. Available: {string.Join(", ", toolMap.Keys.OrderBy(k => k))}";
+                            results[idx] = new FunctionResultContent(call.CallId ?? "", err);
+                            store?.AppendToolResult(assistantId, recorded?.CallId ?? call.CallId ?? "", toolName, err, true);
+                            return;
+                        }
                     }
 
                     // Permission gate: deny/ask per config rules; mutating tools ask by default.
@@ -269,6 +376,56 @@ public sealed class AgentService(string workspaceRoot, int maxSteps = 25)
         if (text.Length <= MaxToolResultChars) return text;
         return text[..MaxToolResultChars]
             + $"\n… (truncated at {MaxToolResultChars} of {text.Length} chars. Use Read with offset/limit or a narrower Grep for more.)";
+    }
+
+    /// <summary>Recovery for weak models: extract a tool call the model wrote as plain text
+    /// (bare JSON, or fenced ```json) instead of using native tool-calling. Returns null when the
+    /// text is not a disguised tool call.</summary>
+    public static (string Name, JsonElement Arguments)? ParseTextToolCall(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return null;
+        var t = text.Trim();
+        // Strip markdown fences if present.
+        if (t.StartsWith("```"))
+        {
+            var nl = t.IndexOf('\n');
+            if (nl < 0) return null;
+            t = t[(nl + 1)..];
+            var end = t.LastIndexOf("```", StringComparison.Ordinal);
+            if (end >= 0) t = t[..end];
+            t = t.Trim();
+        }
+        if (!t.StartsWith("{")) return null;
+        try
+        {
+            using var doc = JsonDocument.Parse(t);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object) return null;
+            string? name = null;
+            if (root.TryGetProperty("name", out var n) && n.ValueKind == JsonValueKind.String)
+                name = n.GetString();
+            else if (root.TryGetProperty("tool", out var t2) && t2.ValueKind == JsonValueKind.String)
+                name = t2.GetString();
+            if (string.IsNullOrWhiteSpace(name)) return null;
+            JsonElement args = default;
+            if (root.TryGetProperty("arguments", out var a) && a.ValueKind == JsonValueKind.Object) args = a.Clone();
+            else if (root.TryGetProperty("parameters", out var p) && p.ValueKind == JsonValueKind.Object) args = p.Clone();
+            else if (root.TryGetProperty("args", out var a2) && a2.ValueKind == JsonValueKind.Object) args = a2.Clone();
+            else args = JsonSerializer.SerializeToElement(new Dictionary<string, object?>());
+            return (name, args);
+        }
+        catch { return null; }
+    }
+
+    /// <summary>Fuzzy-repair a tool name: case/dash/underscore-insensitive + prefix match.</summary>
+    public static string? RepairToolName(string name, IEnumerable<string> available)
+    {
+        var exact = available.FirstOrDefault(a => a.Equals(name, StringComparison.OrdinalIgnoreCase));
+        if (exact is not null) return exact;
+        static string Norm(string s) => new(s.Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
+        var target = Norm(name);
+        return available.FirstOrDefault(a => Norm(a) == target)
+            ?? available.FirstOrDefault(a => Norm(a).StartsWith(target) || target.StartsWith(Norm(a)));
     }
 
     /// <summary>GetResponseAsync with exponential backoff (0.5s, 1s, 2s) on transient errors.</summary>
