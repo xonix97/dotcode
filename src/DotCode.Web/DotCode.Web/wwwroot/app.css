@@ -228,9 +228,22 @@ a:hover { color: var(--dc-cyan); text-decoration: none; }
     display: flex; gap: 16px; padding: 7px 0 9px; font-size: 11px;
     color: var(--dc-fg-gutter); max-width: 860px; margin: 0 auto;
 }
-.dc-status .right { margin-left: auto; display: flex; gap: 16px; }
+.dc-status .right { margin-left: auto; display: flex; gap: 16px; align-items: center; }
 .dc-status b { color: var(--dc-fg-dark); font-weight: 600; }
 .dc-auto { color: var(--dc-yellow); }
+
+/* context meter */
+.dc-ctx { display: flex; align-items: center; gap: 6px; }
+.dc-ctx-bar {
+    width: 56px; height: 4px; border-radius: 2px;
+    background: var(--dc-bg-highlight); overflow: hidden;
+}
+.dc-ctx-fill {
+    display: block; height: 100%; border-radius: 2px;
+    background: var(--dc-fg-gutter); transition: width .3s;
+}
+.dc-ctx-fill.warm { background: var(--dc-yellow); }
+.dc-ctx-fill.hot { background: var(--dc-red); }
 
 /* autocomplete popup */
 .dc-popup {

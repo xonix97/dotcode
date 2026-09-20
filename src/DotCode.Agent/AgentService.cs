@@ -21,6 +21,41 @@ public sealed class AgentService(string workspaceRoot, int maxSteps = 25)
     /// <summary>Per tool result character cap (huge outputs are persisted, trimmed for the model).</summary>
     private const int MaxToolResultChars = 12_000;
 
+    /// <summary>Transient failures worth retrying: network/timeout/429/5xx-shaped messages.</summary>
+    private static bool IsTransient(Exception ex)
+    {
+        var msg = ex.Message;
+        return ex is TaskCanceledException or TimeoutException or IOException
+            || msg.Contains("timed out", StringComparison.OrdinalIgnoreCase)
+            || msg.Contains("timeout", StringComparison.OrdinalIgnoreCase)
+            || msg.Contains("connection", StringComparison.OrdinalIgnoreCase)
+            || msg.Contains("ECONNRESET", StringComparison.OrdinalIgnoreCase)
+            || msg.Contains("socket", StringComparison.OrdinalIgnoreCase)
+            || msg.Contains("429", StringComparison.Ordinal)
+            || msg.Contains("rate limit", StringComparison.OrdinalIgnoreCase)
+            || msg.Contains("overloaded", StringComparison.OrdinalIgnoreCase)
+            || msg.Contains("502", StringComparison.Ordinal)
+            || msg.Contains("503", StringComparison.Ordinal)
+            || msg.Contains("504", StringComparison.Ordinal);
+    }
+
+    /// <summary>GetResponseAsync with exponential backoff (0.5s, 1s, 2s) on transient errors.</summary>
+    private static async Task<ChatResponse> GetResponseWithRetryAsync(
+        IChatClient client, List<ChatMessage> messages, ChatOptions? options, CancellationToken ct)
+    {
+        for (int attempt = 0; ; attempt++)
+        {
+            try
+            {
+                return await client.GetResponseAsync(messages, options, ct);
+            }
+            catch (Exception ex) when (attempt < 3 && IsTransient(ex) && !ct.IsCancellationRequested)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(500 * Math.Pow(2, attempt)), ct);
+            }
+        }
+    }
+
     private static readonly HashSet<string> ReadOnlyTools = new(StringComparer.OrdinalIgnoreCase)
         { "Read", "Glob", "Grep", "TodoRead", "ListDir" };
 
@@ -152,7 +187,7 @@ public sealed class AgentService(string workspaceRoot, int maxSteps = 25)
                         "what was verified, what remains. Be specific and honest."));
                 }
 
-                var response = await client.GetResponseAsync(messages, options, ct);
+                var response = await GetResponseWithRetryAsync(client, messages, options, ct);
                 var calls = response.Messages.SelectMany(m => m.Contents.OfType<FunctionCallContent>()).ToList();
 
                 // Persist the model's reasoning text before tool runs so the UI shows it live.
@@ -228,7 +263,7 @@ public sealed class AgentService(string workspaceRoot, int maxSteps = 25)
                             "progress made so far, immediate next steps, and what to verify.";
                 try
                 {
-                    var wrap = await client.GetResponseAsync(messages, new ChatOptions { Tools = null }, ct);
+                    var wrap = await GetResponseWithRetryAsync(client, messages, new ChatOptions { Tools = null }, ct);
                     if (!string.IsNullOrWhiteSpace(wrap.Text)) finalText = wrap.Text.Trim();
                 }
                 catch { }

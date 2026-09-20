@@ -111,7 +111,18 @@
     <Composer SessionId="@Id" Busy="@_busy" OnSend="Send" OnSlashCommand="Slash" />
     <div class="dc-status">
         <span>@_projectName</span>
-        <span class="right"><span>agent <b>@Ui.GetAgent(Id)</b></span><span>model <b>@ModelLabel</b></span>@if (Ui.AutoApprove){<span class="dc-auto">auto</span>}</span>
+        <span class="right">
+            <span class="dc-ctx" title="rough estimate: thread text / 4 + ~3k system prompt">
+                <span class="dc-ctx-bar"><span class="dc-ctx-fill @(_contextPct > 85 ? "hot" : _contextPct > 60 ? "warm" : "")" style="width:@_contextPct%"></span></span>
+                <span>ctx ~@(_contextTokens.ToString("#,0")) tk</span>
+            </span>
+            <span>agent <b>@Ui.GetAgent(Id)</b></span>
+            <span>model <b>@ModelLabel</b></span>
+            @if (Ui.AutoApprove)
+            {
+                <span class="dc-auto">auto</span>
+            }
+        </span>
     </div>
 </div>
 
@@ -205,8 +216,24 @@
             _threads = await Api.MessagesAsync(Id);
             var last = _threads?.LastOrDefault(t => t.Info.Role == "assistant" && !t.Info.Id.StartsWith("local-"));
             _partCount = last?.Parts.Count ?? 0;
+            ComputeContext();
         }
         catch { _threads = new(); }
+    }
+
+    // ---- context meter: rough estimate, chars/4 + system prompt allowance ----
+    private const int EstContextWindow = 128_000;
+    private int _contextTokens;
+    private int _contextPct;
+
+    private void ComputeContext()
+    {
+        long chars = 3_000; // system prompt + AGENTS.md allowance
+        foreach (var t in _threads ?? new())
+            foreach (var p in t.Parts)
+                chars += (p.Text?.Length ?? 0) + (p.Input?.Length ?? 0) + (p.Output?.Length ?? 0);
+        _contextTokens = (int)(chars / 4);
+        _contextPct = Math.Clamp(_contextTokens * 100 / EstContextWindow, 0, 100);
     }
 
     private async Task LoadTodos()
