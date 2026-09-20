@@ -1,6 +1,8 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.FileSystemGlobbing;
@@ -35,6 +37,9 @@ public sealed class DotCodeToolset(Workspace workspace)
 
     /// <summary>True once TodoWrite has been called this turn (weak-model plan-first gate).</summary>
     public bool HasPlan { get; private set; }
+
+    /// <summary>Harness escape hatch: lets mutating tools through after repeated plan failures.</summary>
+    public void MarkPlanned() => HasPlan = true;
 
     /// <summary>Resets per-turn state (call at the start of each agent turn).</summary>
     public void BeginTurn()
@@ -239,7 +244,7 @@ public sealed class DotCodeToolset(Workspace workspace)
 
     [Description("Replace the session's todo list. Use to track multi-step work; mark items done as you go.")]
     public string TodoWrite(
-        [Description("Full todo list replacing the previous one, in order.")] TodoInput[] todos)
+        [Description("Todo items, each an object {\"content\": string, \"done\": bool}. Plain strings are also accepted.")] TodoInput[] todos)
     {
         if (_todoStore is null || _sessionId is null)
             return "Error: todo store unavailable (no session context).";
@@ -263,13 +268,76 @@ public sealed class DotCodeToolset(Workspace workspace)
         return sb.ToString();
     }
 
+    [JsonConverter(typeof(TodoItemJsonConverter))]
     public sealed record TodoInput(string content, bool done = false);
 
-    public IReadOnlyList<AITool> AsAITools() =>
-        GetType().GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.DeclaredOnly)
-            .Where(m => m.Name is not nameof(AsAITools) and not nameof(WithSession) and not nameof(BeginTurn))
+    /// <summary>Accepts todo items as objects ({content, done} — with common key variants like text/task/status)
+    /// OR plain strings. Weak models frequently send ["step one", "step two"].</summary>
+    private sealed class TodoItemJsonConverter : JsonConverter<TodoInput>
+    {
+        public override TodoInput Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+        {
+            switch (reader.TokenType)
+            {
+                case JsonTokenType.String:
+                    return new TodoInput(reader.GetString() ?? "todo", false);
+                case JsonTokenType.Number:
+                    return new TodoInput(reader.GetDouble().ToString(System.Globalization.CultureInfo.InvariantCulture), false);
+                case JsonTokenType.StartObject:
+                {
+                    string? content = null;
+                    bool done = false;
+                    while (reader.Read())
+                    {
+                        if (reader.TokenType == JsonTokenType.EndObject) break;
+                        if (reader.TokenType != JsonTokenType.PropertyName) { reader.Skip(); continue; }
+                        var prop = reader.GetString();
+                        if (!reader.Read()) break;
+                        switch (prop)
+                        {
+                            case "content": case "text": case "task": case "description": case "title": case "name":
+                                content = reader.TokenType == JsonTokenType.String ? reader.GetString() : reader.GetDouble().ToString(System.Globalization.CultureInfo.InvariantCulture);
+                                break;
+                            case "done": case "completed":
+                                done = reader.TokenType == JsonTokenType.True
+                                    || (reader.TokenType == JsonTokenType.String && reader.GetString() is string bs
+                                        && (bs.Equals("true", StringComparison.OrdinalIgnoreCase) || bs.Equals("done", StringComparison.OrdinalIgnoreCase)));
+                                break;
+                            case "status": case "state":
+                                if (reader.TokenType == JsonTokenType.String)
+                                    done = reader.GetString() is string s
+                                        && (s.Equals("done", StringComparison.OrdinalIgnoreCase) || s.Equals("completed", StringComparison.OrdinalIgnoreCase));
+                                break;
+                            default:
+                                reader.Skip();
+                                break;
+                        }
+                    }
+                    return new TodoInput(string.IsNullOrWhiteSpace(content) ? "todo" : content, done);
+                }
+                default:
+                    throw new JsonException($"Todo item must be a string or an object, got {reader.TokenType}.");
+            }
+        }
+
+        public override void Write(Utf8JsonWriter writer, TodoInput value, JsonSerializerOptions options)
+        {
+            writer.WriteStartObject();
+            writer.WriteString("content", value.content);
+            writer.WriteBoolean("done", value.done);
+            writer.WriteEndObject();
+        }
+    }
+
+    public IReadOnlyList<AITool> AsAITools()
+    {
+        var excluded = new[] { nameof(AsAITools), nameof(WithSession), nameof(BeginTurn), nameof(MarkPlanned) };
+        return GetType().GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.DeclaredOnly)
+            .Where(m => !excluded.Contains(m.Name))
+            .Where(m => !m.IsSpecialName) // excludes property getters like get_HasPlan
             .Select(m => (AITool)AIFunctionFactory.Create(m, this))
             .ToList();
+    }
 
     private static bool MatchesGlob(string fileName, string pattern)
     {

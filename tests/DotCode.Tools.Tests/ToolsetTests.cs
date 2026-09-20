@@ -95,7 +95,8 @@ public sealed class ToolsetTests : IDisposable
     public void AsAITools_ExposesTenFunctions()
     {
         var tools = _tools.AsAITools();
-        Assert.Equal(10, tools.Count);
+        Assert.Equal(9, tools.Count); // MarkPlanned and HasPlan are harness-only, never exposed
+        Assert.DoesNotContain(tools, t => t.Name.Contains("MarkPlanned") || t.Name.Contains("HasPlan"));
         Assert.Contains(tools, t => t.Name.Equals("Read", StringComparison.OrdinalIgnoreCase));
         Assert.Contains(tools, t => t.Name.Equals("Bash", StringComparison.OrdinalIgnoreCase));
         Assert.Contains(tools, t => t.Name.Equals("Tree", StringComparison.OrdinalIgnoreCase));

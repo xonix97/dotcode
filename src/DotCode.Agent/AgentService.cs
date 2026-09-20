@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using DotCode.Core.Auth;
 using DotCode.Core.Config;
 using DotCode.Core.Permissions;
@@ -207,6 +208,7 @@ public sealed class AgentService(string workspaceRoot, int maxSteps = 25)
         try
         {
             var finalText = "";
+            int planGateFails = 0; // repeated TodoWrite failures lift the plan-first gate
             for (int step = 0; step < stepLimit; step++)
             {
                 // Last step: forbid new tool calls so the model must produce a final answer.
@@ -231,6 +233,21 @@ public sealed class AgentService(string workspaceRoot, int maxSteps = 25)
                         "Your last message could not be parsed as a tool call. Re-send it using EXACTLY one native " +
                         "tool call with valid JSON arguments — no prose around it."));
                     store?.AppendAssistantTextPart(assistantId, "(harness: malformed tool call — requesting retry)");
+                    continue;
+                }
+                catch (Exception ex) when (
+                    ex.Message.Contains("error parsing tool call", StringComparison.OrdinalIgnoreCase)
+                    || (ex.Message.Contains("500", StringComparison.Ordinal) && ex.Message.Contains("tool", StringComparison.OrdinalIgnoreCase)))
+                {
+                    // Provider-side tool-call parse failure (Ollama: HTTP 500 "error parsing tool call",
+                    // usually a truncated/oversized call hitting its small default context). Recover and
+                    // steer: split the work into smaller tool calls; never abort the whole turn.
+                    messages.Add(new ChatMessage(ChatRole.User,
+                        "Your last tool call could not be parsed by the server (likely too large or malformed). " +
+                        "Continue the task with SMALLER steps: create or edit files in parts (e.g. write the HTML shell first, " +
+                        "then append/extend with a second call), keep each call under ~120 lines, and re-send the same action " +
+                        "as exactly one clean native tool call."));
+                    store?.AppendAssistantTextPart(assistantId, "(harness: server could not parse tool call — requesting smaller retry)");
                     continue;
                 }
                 var calls = response.Messages.SelectMany(m => m.Contents.OfType<FunctionCallContent>()).ToList();
@@ -266,7 +283,8 @@ public sealed class AgentService(string workspaceRoot, int maxSteps = 25)
                 }
 
                 // Weak models: exactly one call per step (their batching is unreliable),
-                // and a plan-first gate on mutating tools.
+                // and a plan-first gate on mutating tools — with an escape hatch so the
+                // gate can never deadlock a model that keeps failing to plan.
                 if (weak && calls.Count > 1)
                     calls = [calls[0]];
                 if (weak && calls.Count == 1)
@@ -274,10 +292,19 @@ public sealed class AgentService(string workspaceRoot, int maxSteps = 25)
                     var cn = calls[0].Name ?? "";
                     if (MutatingTools.Contains(cn) && cn != "TodoWrite" && !toolset.HasPlan)
                     {
-                        var ask = "Before changing files you must plan. Call TodoWrite now with a short numbered plan for this task, then continue step by step.";
-                        messages.Add(new ChatMessage(ChatRole.User, ask));
-                        store?.AppendAssistantTextPart(assistantId, "(harness: requesting plan first)");
-                        continue;
+                        if (planGateFails >= 3)
+                        {
+                            toolset.MarkPlanned(); // let it proceed; the gate has done its job
+                            store?.AppendAssistantTextPart(assistantId, "(harness: plan gate lifted after repeated failures)");
+                        }
+                        else
+                        {
+                            planGateFails++;
+                            var ask = $"Before changing files you must plan. Call TodoWrite now. Every todo item must be an object like {{\"content\": \"step one\", \"done\": false}} inside a todos array — exactly one tool call, nothing else.";
+                            messages.Add(new ChatMessage(ChatRole.User, ask));
+                            store?.AppendAssistantTextPart(assistantId, "(harness: requesting plan first)");
+                            continue;
+                        }
                     }
                 }
 
@@ -333,6 +360,20 @@ public sealed class AgentService(string workspaceRoot, int maxSteps = 25)
                         var persisted = TruncateToolOutput(text);
                         results[idx] = new FunctionResultContent(call.CallId ?? "", persisted);
                         store?.AppendToolResult(assistantId, recorded?.CallId ?? call.CallId ?? "", toolName, persisted);
+                    }
+                    catch (JsonException ex)
+                    {
+                        // Weak models send the wrong argument shapes constantly. Give them a
+                        // precise, retryable error instead of a cryptic serializer dump.
+                        var err = $"Error: bad arguments for {toolName} ({ex.Message.Split('\n')[0]}). Check the tool's parameter names and types, fix the JSON, and retry.";
+                        results[idx] = new FunctionResultContent(call.CallId ?? "", err);
+                        store?.AppendToolResult(assistantId, recorded?.CallId ?? call.CallId ?? "", toolName, err, true);
+                    }
+                    catch (Exception ex) when (ex.Message.Contains("error parsing tool call", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // The provider failed to parse the model's OWN tool call (Ollama 500). Never kill
+                        // the turn: rethrow to the step-level recovery handler, which asks for a resend.
+                        throw;
                     }
                     catch (Exception ex)
                     {
